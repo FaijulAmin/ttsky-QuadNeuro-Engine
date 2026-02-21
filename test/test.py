@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Comprehensive cocotb testbench for tt_um_matmul
-# Covers all 4 modes with edge cases, corner cases, and random regression.
+# Matches RTL protocol in tt_um_matmul.v exactly.
 
 import cocotb
 from cocotb.clock import Clock
@@ -41,7 +41,7 @@ def golden_4x4(A, B, relu=False, C_prev=None, accum=False):
             C[i][j] = val
     return C
 
-# ─── Protocol helpers ─────────────────────────────────────────
+# ─── Reset / packing / decode ────────────────────────────────
 
 async def do_reset(dut):
     dut.rst_n.value  = 0
@@ -53,7 +53,7 @@ async def do_reset(dut):
     await ClockCycles(dut.clk, 2)
 
 def pack_2x2(A, B):
-    """Row-major bytes: A then B."""
+    """LOAD byte order from RTL header: A row-major then B row-major."""
     flat = [
         A[0][0], A[0][1], A[1][0], A[1][1],
         B[0][0], B[0][1], B[1][0], B[1][1],
@@ -61,71 +61,26 @@ def pack_2x2(A, B):
     return [int(v) & 0xFF for v in flat]
 
 def pack_4x4(A, B):
-    """Row-major 32 bytes: A then B."""
+    """LOAD byte order from RTL header: A row-major (16) then B row-major (16)."""
     flat = [A[r][c] for r in range(4) for c in range(4)] + \
            [B[r][c] for r in range(4) for c in range(4)]
     return [int(v) & 0xFF for v in flat]
 
 def decode_output(raw, n_elements):
     """
-    Decode n_elements*3 bytes into signed 20-bit integers.
-    Must match RTL packing:
-      byte0 = [7:0], byte1 = [15:8], byte2 = {0000, [19:16]}  (LSB first)
+    OUTPUT packing from RTL:
+      byte0=result[7:0], byte1=result[15:8], byte2={4'b0, result[19:16]}
     """
-    results = []
+    out = []
     for i in range(n_elements):
-        lo  = raw[i * 3 + 0] & 0xFF
-        mid = raw[i * 3 + 1] & 0xFF
-        hi4 = raw[i * 3 + 2] & 0x0F
-        val = lo | (mid << 8) | (hi4 << 16)   # 20-bit value
-        if val & (1 << 19):                   # sign extend from bit 19
+        b0 = raw[i * 3 + 0] & 0xFF
+        b1 = raw[i * 3 + 1] & 0xFF
+        b2 = raw[i * 3 + 2] & 0x0F
+        val = b0 | (b1 << 8) | (b2 << 16)      # 20-bit
+        if val & (1 << 19):                    # sign extend
             val -= (1 << 20)
-        results.append(val)
-    return results
-
-async def run_transaction(dut, mode, input_bytes, n_out_elements, accum_clear=False):
-    """
-    Full protocol transaction:
-      1) Pulse start with mode bits set (and optional accum_clear)
-      2) Load input_bytes serially (one byte per cycle)
-      3) Wait compute cycles (2x2=1, 4x4*=8)
-      4) Read output stream: 3 bytes per element, LSB first
-    Returns list of signed 20-bit integers (row-major).
-    """
-    # Assert start with mode and accum_clear
-    await RisingEdge(dut.clk)
-    ctrl = 0x01 | (mode << 1) | ((1 << 3) if accum_clear else 0)
-    dut.uio_in.value = ctrl
-    dut.ui_in.value = 0
-
-    # LOAD: deassert start, send bytes
-    await RisingEdge(dut.clk)
-    dut.uio_in.value = (mode << 1)  # start=0
-    dut.ui_in.value = input_bytes[0]
-
-    for i in range(1, len(input_bytes)):
-        await RisingEdge(dut.clk)
-        dut.ui_in.value = input_bytes[i]
-
-    # Wait COMPUTE cycles
-    n_compute = 1 if (mode == 0) else 8
-    for _ in range(n_compute):
-        await RisingEdge(dut.clk)
-    dut.ui_in.value = 0
-
-    # OUTPUT:
-    # Important: don't skip the first byte. After the last compute edge,
-    # the first output byte is already being driven combinationally in ST_OUTPUT.
-    raw = []
-    await ReadOnly()
-    raw.append(int(dut.uo_out.value))
-
-    for _ in range(n_out_elements * 3 - 1):
-        await RisingEdge(dut.clk)
-        await ReadOnly()
-        raw.append(int(dut.uo_out.value))
-
-    return decode_output(raw, n_out_elements)
+        out.append(val)
+    return out
 
 def flatten_2x2(C):
     return [C[r][c] for r in range(2) for c in range(2)]
@@ -133,16 +88,74 @@ def flatten_2x2(C):
 def flatten_4x4(C):
     return [C[r][c] for r in range(4) for c in range(4)]
 
-# ─── Test helpers ─────────────────────────────────────────────
+# ─── Clock / assertion helpers ───────────────────────────────
 
 async def start_clock(dut):
-    # cocotb v2 uses "unit" (not "units")
     clock = Clock(dut.clk, 30, unit="ns")  # 33 MHz
     cocotb.start_soon(clock.start())
 
 def assert_eq(got, exp, name):
     if got != exp:
         raise AssertionError(f"{name} FAIL:\n  got={got}\n  exp={exp}")
+
+# ─── Transaction runner (FIXED timing) ───────────────────────
+
+async def run_transaction(dut, mode, input_bytes, n_out_elements, accum_clear=False):
+    """
+    Matches RTL FSM:
+
+    - start must be high on a rising edge in IDLE
+    - LOAD samples ui_in on each rising edge in ST_LOAD
+    - wait until done (uio_out[0]) goes high => we're in OUTPUT
+    - read uo_out stream: 3 bytes/element, LSB first
+    - wait until done drops so next transaction can start
+    """
+    n_out_bytes = n_out_elements * 3
+
+    # --- START pulse (must be high at a clock edge) ---
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0x01 | (mode << 1) | ((1 << 3) if accum_clear else 0)
+    await RisingEdge(dut.clk)
+
+    # deassert start; mode bits can stay (ignored except at start)
+    dut.uio_in.value = (mode << 1)
+    dut.ui_in.value = 0
+
+    # --- LOAD: drive BEFORE edge, then edge samples it ---
+    for b in input_bytes:
+        dut.ui_in.value = int(b) & 0xFF
+        await RisingEdge(dut.clk)
+
+    # stop driving data
+    dut.ui_in.value = 0
+
+    # --- Wait for OUTPUT (done==1) in the *current* cycle ---
+    while True:
+        await ReadOnly()
+        done = int(dut.uio_out.value) & 0x1
+        if done == 1:
+            break
+        await RisingEdge(dut.clk)
+
+    # --- Read output bytes starting immediately (no extra leading 0) ---
+    raw = []
+    await ReadOnly()
+    raw.append(int(dut.uo_out.value) & 0xFF)
+
+    for _ in range(n_out_bytes - 1):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        raw.append(int(dut.uo_out.value) & 0xFF)
+
+    # --- Wait until OUTPUT finishes (done drops) so back-to-back works ---
+    while True:
+        await ReadOnly()
+        done = int(dut.uio_out.value) & 0x1
+        if done == 0:
+            break
+        await RisingEdge(dut.clk)
+
+    return decode_output(raw, n_out_elements)
 
 # ═════════════════════════════════════════════════════════════
 #  MODE 00: 2x2 + ReLU
@@ -185,13 +198,13 @@ async def test_00_one_hot_each_element(dut):
     await start_clock(dut); await do_reset(dut)
     B = [[3, 7], [11, 5]]
     positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
     for r, c in positions:
         A = [[0, 0], [0, 0]]
         A[r][c] = 64
         got = await run_transaction(dut, 0, pack_2x2(A, B), 4)
         exp = flatten_2x2(golden_2x2_relu(A, B))
         assert_eq(got, exp, f"mode00 one_hot_A[{r}][{c}]")
-        await ClockCycles(dut.clk, 2)
 
     A = [[3, 7], [11, 5]]
     for r, c in positions:
@@ -200,7 +213,6 @@ async def test_00_one_hot_each_element(dut):
         got = await run_transaction(dut, 0, pack_2x2(A, B2), 4)
         exp = flatten_2x2(golden_2x2_relu(A, B2))
         assert_eq(got, exp, f"mode00 one_hot_B[{r}][{c}]")
-        await ClockCycles(dut.clk, 2)
 
 @cocotb.test()
 async def test_00_mixed_signs(dut):
@@ -220,7 +232,6 @@ async def test_00_random_regression(dut):
         got = await run_transaction(dut, 0, pack_2x2(A, B), 4)
         exp = flatten_2x2(golden_2x2_relu(A, B))
         assert_eq(got, exp, f"mode00 random[{i}]")
-        await ClockCycles(dut.clk, 1)
 
 # ═════════════════════════════════════════════════════════════
 #  MODE 01: 4x4 raw
@@ -269,7 +280,6 @@ async def test_01_one_hot_each_element(dut):
             got = await run_transaction(dut, 1, pack_4x4(A, B), 16)
             exp = flatten_4x4(golden_4x4(A, B))
             assert_eq(got, exp, f"mode01 one_hot_A[{r}][{c}]")
-            await ClockCycles(dut.clk, 2)
 
 @cocotb.test()
 async def test_01_mixed_extremes(dut):
@@ -282,7 +292,6 @@ async def test_01_mixed_extremes(dut):
         got = await run_transaction(dut, 1, pack_4x4(A, B), 16)
         exp = flatten_4x4(golden_4x4(A, B))
         assert_eq(got, exp, f"mode01 extremes[{i}]")
-        await ClockCycles(dut.clk, 2)
 
 @cocotb.test()
 async def test_01_random_regression(dut):
@@ -294,7 +303,6 @@ async def test_01_random_regression(dut):
         got = await run_transaction(dut, 1, pack_4x4(A, B), 16)
         exp = flatten_4x4(golden_4x4(A, B))
         assert_eq(got, exp, f"mode01 random[{i}]")
-        await ClockCycles(dut.clk, 1)
 
 # ═════════════════════════════════════════════════════════════
 #  MODE 10: 4x4 + ReLU
@@ -328,7 +336,6 @@ async def test_10_random_regression(dut):
         got = await run_transaction(dut, 2, pack_4x4(A, B), 16)
         exp = flatten_4x4(golden_4x4(A, B, relu=True))
         assert_eq(got, exp, f"mode10 random[{i}]")
-        await ClockCycles(dut.clk, 1)
 
 # ═════════════════════════════════════════════════════════════
 #  MODE 11: 4x4 tiled accumulate
@@ -338,6 +345,7 @@ async def test_10_random_regression(dut):
 async def test_11_clear_then_accumulate(dut):
     await start_clock(dut); await do_reset(dut)
     rng = random.Random(5005)
+
     A1 = [[rng.randint(-64, 64) for _ in range(4)] for _ in range(4)]
     B1 = [[rng.randint(-64, 64) for _ in range(4)] for _ in range(4)]
     A2 = [[rng.randint(-64, 64) for _ in range(4)] for _ in range(4)]
@@ -346,7 +354,6 @@ async def test_11_clear_then_accumulate(dut):
     got1 = await run_transaction(dut, 3, pack_4x4(A1, B1), 16, accum_clear=True)
     exp1 = flatten_4x4(golden_4x4(A1, B1))
     assert_eq(got1, exp1, "mode11 tile1")
-    await ClockCycles(dut.clk, 2)
 
     got2 = await run_transaction(dut, 3, pack_4x4(A2, B2), 16, accum_clear=False)
     C1 = [[got1[r * 4 + c] for c in range(4)] for r in range(4)]
@@ -357,26 +364,26 @@ async def test_11_clear_then_accumulate(dut):
 async def test_11_three_tile_chain(dut):
     await start_clock(dut); await do_reset(dut)
     rng = random.Random(6006)
+
     tiles = [
         ([[rng.randint(-50, 50) for _ in range(4)] for _ in range(4)],
          [[rng.randint(-50, 50) for _ in range(4)] for _ in range(4)])
         for _ in range(3)
     ]
+
     C_running = None
     for idx, (A, B) in enumerate(tiles):
-        clr = (idx == 0)
-        got = await run_transaction(dut, 3, pack_4x4(A, B), 16, accum_clear=clr)
+        got = await run_transaction(dut, 3, pack_4x4(A, B), 16, accum_clear=(idx == 0))
         C_running = golden_4x4(A, B, C_prev=C_running, accum=(idx > 0))
         assert_eq(got, flatten_4x4(C_running), f"mode11 tile{idx}")
-        await ClockCycles(dut.clk, 2)
 
 @cocotb.test()
 async def test_11_clear_resets_accumulator(dut):
     await start_clock(dut); await do_reset(dut)
+
     A = [[127] * 4 for _ in range(4)]
     B = [[127] * 4 for _ in range(4)]
     await run_transaction(dut, 3, pack_4x4(A, B), 16, accum_clear=True)
-    await ClockCycles(dut.clk, 2)
 
     A2 = [[1 if r == c else 0 for c in range(4)] for r in range(4)]
     B2 = [[r + 1 if c == 0 else 0 for c in range(4)] for r in range(4)]
@@ -413,6 +420,7 @@ async def test_fsm_back_to_back_mode01(dut):
 @cocotb.test()
 async def test_fsm_mode_switch(dut):
     await start_clock(dut); await do_reset(dut)
+
     A2 = [[10, -5], [3, 7]]
     B2 = [[2, 0], [1, -1]]
     got2 = await run_transaction(dut, 0, pack_2x2(A2, B2), 4)
@@ -427,12 +435,15 @@ async def test_fsm_mode_switch(dut):
 async def test_fsm_reset_recovery(dut):
     await start_clock(dut); await do_reset(dut)
 
+    # begin a start then reset mid-stream
     dut.uio_in.value = 0x01  # start
+    dut.ui_in.value = 0
     await RisingEdge(dut.clk)
     dut.uio_in.value = 0x00
     dut.ui_in.value = 0x55
-    for _ in range(4):
-        await RisingEdge(dut.clk)
+    await RisingEdge(dut.clk)
+    dut.ui_in.value = 0xAA
+    await RisingEdge(dut.clk)
 
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 3)
