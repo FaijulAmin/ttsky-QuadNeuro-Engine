@@ -7,14 +7,85 @@ You can also include images in this folder and reference them in the markdown. E
 512 kb in size, and the combined size of all images must be less than 1 MB.
 -->
 
+# 4-Mode Matrix Multiply Accelerator
+
 ## How it works
 
-Explain how your project works
+This chip implements a configurable matrix multiply accelerator with four operating modes, all built around **8 shared signed int8 multipliers** that are time-multiplexed across compute passes.
 
-## How to test
+### Modes
 
-Explain how to use your project
+| `uio[2:1]` | Mode | Compute cycles | Output bytes |
+|------------|------|---------------|--------------|
+| `00` | 2×2 matmul + ReLU | 1 | 12 |
+| `01` | 4×4 matmul raw | 8 | 48 |
+| `10` | 4×4 matmul + ReLU | 8 | 48 |
+| `11` | 4×4 tiled accumulate (C += A×B) | 8 | 48 |
+
+### Architecture
+
+**Number format:** Signed int8 inputs (−128 to 127), signed int20 outputs (20-bit two's-complement wrap).
+
+**Hardware:** 8 shared signed 8-bit multipliers. In 2×2 mode all 4 outputs are computed simultaneously (1 cycle). In 4×4 mode the multiplier bank is reused across 8 passes (2 outputs per pass).
+
+**ReLU:** A sign-bit check and mux on each output register — near-zero hardware cost.
+
+**Tiled accumulate (mode 11):** C registers persist between calls. Set `uio[3]` (accum_clear) to 1 on the first tile of a new computation. This lets you multiply matrices larger than 4×4 by decomposing them into 4×4 blocks.
+
+### FSM
+
+```
+IDLE → LOAD → COMPUTE (1 or 8 cycles) → OUTPUT → IDLE
+```
+
+## How to use it
+
+### Pin Map
+
+| Pin | Direction | Function |
+|-----|-----------|----------|
+| `ui_in[7:0]` | Input | Serial data byte in |
+| `uo_out[7:0]` | Output | Serial data byte out |
+| `uio[0]` | Bidir | `start` (input pulse) / `done` (output high) |
+| `uio[2:1]` | Input | Mode select |
+| `uio[3]` | Input | Accumulator clear (mode 11 only) |
+
+### Protocol
+
+**Step 1 — Start:** Assert `uio[0]` high for 1 clock cycle. Set `uio[2:1]` to desired mode. Set `uio[3]` if clearing accumulator.
+
+**Step 2 — Load:** Present bytes on `ui_in`, one per rising clock edge.
+
+- **2×2 (8 bytes):** `A[0][0] A[0][1] A[1][0] A[1][1]` then `B[0][0] B[0][1] B[1][0] B[1][1]`
+- **4×4 (32 bytes):** A row-major `A[0][0..3] A[1][0..3] A[2][0..3] A[3][0..3]` then B row-major
+
+**Step 3 — Compute:** Automatic (1 cycle for 2×2, 8 cycles for 4×4). No action required.
+
+**Step 4 — Read:** `uio[0]` (done) goes high. Read bytes from `uo_out`, one per clock.
+
+- **2×2 (12 bytes):** C row-major, 3 bytes per element
+- **4×4 (48 bytes):** C row-major, 3 bytes per element
+
+**Output encoding** (3 bytes per 20-bit result):
+- Byte 0: `result[7:0]`
+- Byte 1: `result[15:8]`
+- Byte 2: `{4'b0, result[19:16]}`
+
+### Tiled accumulation example
+
+To multiply two 8×4 matrices using 4×4 tiles:
+
+```
+# Block: C[0:4][0:4] = A[0:4][0:4]@B[0:4][0:4] + A[0:4][4:8]@B[4:8][0:4]
+send tile A[0:4][0:4], B[0:4][0:4]  with accum_clear=1  → C  = tile1
+send tile A[0:4][4:8], B[4:8][0:4]  with accum_clear=0  → C += tile2
+read result
+```
 
 ## External hardware
 
-List external hardware used in your project (e.g. PMOD, LED display, etc), if any
+None required. Standard TinyTapeout pin interface only.
+
+## Why hardware wins
+
+A CPU multiplies these matrices sequentially (~64 multiplications in series). This chip fires **8 multiplications simultaneously** every clock cycle, completing the full 4×4 multiply in 8 cycles — using a 33 MHz clock that draws µW, vs a GHz CPU drawing watts. The tiled accumulation mode extends this advantage to arbitrarily large matrices.
