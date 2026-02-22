@@ -7,11 +7,11 @@ You can also include images in this folder and reference them in the markdown. E
 512 kb in size, and the combined size of all images must be less than 1 MB.
 -->
 
-# 4-Mode Matrix Multiply Accelerator
+# QuadNeuro Engine: A 4-Mode Matrix Multiplication Accelerator
 
 ## How it works
 
-This chip implements a configurable matrix multiply accelerator with four operating modes, all built around **8 shared signed int8 multipliers** that are time-multiplexed across compute passes.
+This chip implements a configurable matrix multiplication accelerator with four operating modes, all built around **8 shared signed 8-bit integer multipliers** that are time-multiplexed across compute passes.
 
 ### Modes
 
@@ -24,11 +24,11 @@ This chip implements a configurable matrix multiply accelerator with four operat
 
 ### Architecture
 
-**Number format:** Signed int8 inputs (−128 to 127), signed int20 outputs (20-bit two's-complement wrap).
+**Number format:** Signed 8 bit int inputs (−128 to 127), signed 20 bit int outputs (20-bit two's-complement wrap).
 
 **Hardware:** 8 shared signed 8-bit multipliers. In 2×2 mode all 4 outputs are computed simultaneously (1 cycle). In 4×4 mode the multiplier bank is reused across 8 passes (2 outputs per pass).
 
-**ReLU:** A sign-bit check and mux on each output register — near-zero hardware cost.
+**ReLU:** A sign-bit check and mux on each output register. Set all negative entries to 0.
 
 **Tiled accumulate (mode 11):** C registers persist between calls. Set `uio[3]` (accum_clear) to 1 on the first tile of a new computation. This lets you multiply matrices larger than 4×4 by decomposing them into 4×4 blocks.
 
@@ -38,7 +38,7 @@ This chip implements a configurable matrix multiply accelerator with four operat
 IDLE → LOAD → COMPUTE (1 or 8 cycles) → OUTPUT → IDLE
 ```
 
-## How to use it
+## How to test
 
 ### Pin Map
 
@@ -86,6 +86,6 @@ read result
 
 None required. Standard TinyTapeout pin interface only.
 
-## Why hardware wins
+## Conclusion
 
-A CPU multiplies these matrices sequentially (~64 multiplications in series). This chip fires **8 multiplications simultaneously** every clock cycle, completing the full 4×4 multiply in 8 cycles — using a 33 MHz clock that draws µW, vs a GHz CPU drawing watts. The tiled accumulation mode extends this advantage to arbitrarily large matrices.
+While a CPU performs matrix multiplication sequentially, this chip executes 8 multiplications in parallel per cycle, completing a 4×4 multiply in just 8 cycles at microwatt power. Because matrix multiplication dominates neural network computation, accelerating it provides a major performance advantage, while ReLU adds essential nonlinearity at almost no hardware cost. Tiled accumulation and shared multipliers allow the same compact hardware to scale efficiently to larger matrices. Together, these features implement the core operations of neural network inference faster and more efficiently than a general-purpose processor.
