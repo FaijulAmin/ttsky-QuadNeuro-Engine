@@ -15,7 +15,7 @@ This chip implements a configurable matrix multiplication accelerator with four 
 
 ### Modes
 
-| `uio[2:1]` | Mode | Compute cycles | Output bytes |
+| BitCode `uio[2:1]` | Mode | Compute cycles | Output bytes |
 |------------|------|---------------|--------------|
 | `00` | 2×2 matmul + ReLU | 1 | 12 |
 | `01` | 4×4 matmul raw | 8 | 48 |
